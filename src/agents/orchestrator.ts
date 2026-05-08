@@ -3,6 +3,8 @@ import { runSecurityAgent } from './security-agent';
 import { runPerformanceAgent } from './performance-agent';
 import { runStyleAgent } from './style-agent';
 import { runTestAgent } from './test-agent';
+import { runReviewerAgent } from './reviewer-agent';
+import { getModelConfig } from '../config';
 import type { Finding, AgentResult, ReviewComment } from '../types';
 
 const SEVERITY_ORDER: Record<string, number> = { critical: 0, warning: 1, info: 2 };
@@ -23,7 +25,13 @@ function severityEmoji(severity: string): string {
   return '🔵';
 }
 
-function buildSummary(agentResults: AgentResult[], orphanFindings: Finding[]): string {
+function buildSummary(
+  agentResults: AgentResult[],
+  assessment: string,
+  orphanFindings: (Finding & { agentName: string; emoji: string })[],
+  agentModel: string,
+  reviewerModel: string
+): string {
   const allFindings = agentResults.flatMap((r) => r.findings);
   const critical = allFindings.filter((f) => f.severity === 'critical').length;
   const warning = allFindings.filter((f) => f.severity === 'warning').length;
@@ -40,8 +48,7 @@ function buildSummary(agentResults: AgentResult[], orphanFindings: Finding[]): s
   ];
 
   for (const result of agentResults) {
-    const count = result.findings.length;
-    lines.push(`| ${result.emoji} ${result.agentName} | ${count} |`);
+    lines.push(`| ${result.emoji} ${result.agentName} | ${result.findings.length} |`);
   }
 
   lines.push('', '---', '');
@@ -49,6 +56,16 @@ function buildSummary(agentResults: AgentResult[], orphanFindings: Finding[]): s
   lines.push('');
   lines.push(
     `🔴 **${critical} critical** · 🟡 **${warning} warnings** · 🔵 **${info} info** · **${total} total**`
+  );
+
+  lines.push('', '---', '');
+  lines.push('### Overall Assessment');
+  lines.push('');
+  lines.push(assessment);
+
+  lines.push('', '---', '');
+  lines.push(
+    `<sub>Agents: \`${agentModel}\` · Reviewer: \`${reviewerModel}\`</sub>`
   );
 
   if (orphanFindings.length > 0) {
@@ -71,9 +88,11 @@ function buildSummary(agentResults: AgentResult[], orphanFindings: Finding[]): s
   return lines.join('\n');
 }
 
-function buildCommentBody(finding: Finding, agentEmoji: string, agentName: string): string {
+function buildCommentBody(
+  finding: Finding & { agentName: string; emoji: string }
+): string {
   return [
-    `${agentEmoji} **${agentName}** · ${severityEmoji(finding.severity)} \`${finding.severity.toUpperCase()}\` · **${finding.category}**`,
+    `${finding.emoji} **${finding.agentName}** · ${severityEmoji(finding.severity)} \`${finding.severity.toUpperCase()}\` · **${finding.category}**`,
     '',
     finding.message,
     '',
@@ -88,6 +107,8 @@ export async function orchestrate(prUrl: string): Promise<void> {
   if (!githubToken) throw new Error('GITHUB_TOKEN is not set');
   if (!anthropicKey) throw new Error('ANTHROPIC_API_KEY is not set');
 
+  const { agentModel, reviewerModel } = getModelConfig();
+
   const prInfo = parsePrUrl(prUrl);
   console.log(`\n🔍 Fetching PR #${prInfo.pullNumber} from ${prInfo.owner}/${prInfo.repo}...`);
 
@@ -97,36 +118,56 @@ export async function orchestrate(prUrl: string): Promise<void> {
   ]);
 
   console.log(`📄 PR: "${prDetails.title}" (${files.length} files changed)`);
-  console.log('\n🚀 Running agents in parallel...');
+  console.log(`\n🚀 Running agents in parallel [${agentModel}]...`);
 
   const [securityFindings, performanceFindings, styleFindings, testFindings] =
     await Promise.all([
-      runSecurityAgent(files, anthropicKey).then((f) => {
+      runSecurityAgent(files, anthropicKey, agentModel).then((f) => {
         console.log(`  🔒 SecurityAgent: ${f.length} findings`);
         return f;
       }),
-      runPerformanceAgent(files, anthropicKey).then((f) => {
+      runPerformanceAgent(files, anthropicKey, agentModel).then((f) => {
         console.log(`  ⚡ PerformanceAgent: ${f.length} findings`);
         return f;
       }),
-      runStyleAgent(files, anthropicKey).then((f) => {
+      runStyleAgent(files, anthropicKey, agentModel).then((f) => {
         console.log(`  🎨 StyleAgent: ${f.length} findings`);
         return f;
       }),
-      runTestAgent(files, anthropicKey).then((f) => {
+      runTestAgent(files, anthropicKey, agentModel).then((f) => {
         console.log(`  🧪 TestAgent: ${f.length} findings`);
         return f;
       }),
     ]);
 
-  const agentResults: AgentResult[] = [
+  const rawAgentResults: AgentResult[] = [
     { agentName: 'SecurityAgent', emoji: '🔒', findings: deduplicateFindings(securityFindings) },
     { agentName: 'PerformanceAgent', emoji: '⚡', findings: deduplicateFindings(performanceFindings) },
     { agentName: 'StyleAgent', emoji: '🎨', findings: deduplicateFindings(styleFindings) },
     { agentName: 'TestAgent', emoji: '🧪', findings: deduplicateFindings(testFindings) },
   ];
 
-  // Build a map of valid diff lines per file
+  const totalRaw = rawAgentResults.reduce((n, r) => n + r.findings.length, 0);
+  console.log(`\n🧠 Final review pass [${reviewerModel}] on ${totalRaw} findings...`);
+
+  const { findings: reviewedFindings, assessment } = await runReviewerAgent(
+    rawAgentResults,
+    files,
+    anthropicKey,
+    reviewerModel
+  );
+
+  // Rebuild agentResults from reviewed findings so scorecard reflects post-review counts
+  const agentResultMap = new Map<string, AgentResult>();
+  for (const r of rawAgentResults) {
+    agentResultMap.set(r.agentName, { ...r, findings: [] });
+  }
+  for (const f of reviewedFindings) {
+    agentResultMap.get(f.agentName)?.findings.push(f);
+  }
+  const agentResults = [...agentResultMap.values()];
+
+  // Build valid-line map for inline comment eligibility
   const validLinesByFile = new Map<string, Set<number>>();
   for (const file of files) {
     if (file.patch) {
@@ -134,30 +175,26 @@ export async function orchestrate(prUrl: string): Promise<void> {
     }
   }
 
-  // Separate findings into inline comments vs orphans (not in diff)
   const inlineComments: ReviewComment[] = [];
-  const orphanFindings: Finding[] = [];
+  const orphanFindings: (Finding & { agentName: string; emoji: string })[] = [];
 
-  for (const result of agentResults) {
-    for (const finding of result.findings) {
-      const validLines = validLinesByFile.get(finding.file);
-      if (validLines && validLines.has(finding.line)) {
-        inlineComments.push({
-          path: finding.file,
-          line: finding.line,
-          body: buildCommentBody(finding, result.emoji, result.agentName),
-        });
-      } else {
-        orphanFindings.push(finding);
-      }
+  for (const finding of reviewedFindings) {
+    const validLines = validLinesByFile.get(finding.file);
+    if (validLines && validLines.has(finding.line)) {
+      inlineComments.push({
+        path: finding.file,
+        line: finding.line,
+        body: buildCommentBody(finding),
+      });
+    } else {
+      orphanFindings.push(finding);
     }
   }
 
-  const summary = buildSummary(agentResults, orphanFindings);
+  const summary = buildSummary(agentResults, assessment, orphanFindings, agentModel, reviewerModel);
 
   console.log(`\n📝 Posting review with ${inlineComments.length} inline comments...`);
   await postReview(prInfo, githubToken, summary, inlineComments);
 
-  const totalFindings = agentResults.reduce((n, r) => n + r.findings.length, 0);
-  console.log(`\n✅ Review posted! ${totalFindings} findings across all agents.`);
+  console.log(`\n✅ Review posted! ${reviewedFindings.length} findings (${totalRaw - reviewedFindings.length} removed by reviewer).`);
 }
