@@ -27,7 +27,8 @@ If no issues found, return an empty array []. Do not include any explanation out
 
 export async function runTestAgent(
   files: DiffFile[],
-  apiKey: string
+  apiKey: string,
+  model: string
 ): Promise<Finding[]> {
   const client = new Anthropic({ apiKey });
 
@@ -39,7 +40,7 @@ export async function runTestAgent(
   if (!diffText.trim()) return [];
 
   const response = await client.messages.create({
-    model: 'claude-sonnet-4-6',
+    model,
     max_tokens: 4096,
     system: SYSTEM_PROMPT,
     messages: [
